@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import datasets, huggingface_hub; print\\('datasets', datasets.__version__\\); print\\('hf_hub', huggingface_hub.__version__\\)\")",
+      "Bash(python -c \"import langdetect; print\\('langdetect', langdetect.__version__\\)\")",
+      "Bash(python -c \"import datasketch; print\\('datasketch', datasketch.__version__\\)\")",
+      "Bash(python -c \"import hf_transfer; print\\('hf_transfer', hf_transfer.__version__\\)\")",
+      "Bash(pip install *)",
+      "Bash(python prepare_data_local.py --list)",
+      "Bash(python prepare_data_local.py --out-dir ./data --source medmcqa --max-docs 100 --credentials-file prepare_data_local.env)",
+      "Bash(python *)",
+      "PowerShell(cmd /c dir D:\\\\data-claude)"
+    ]
+  }
+}

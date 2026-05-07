@@ -104,6 +104,20 @@ log = logging.getLogger("prep")
 
 SHARD_SIZE = 50_000
 
+
+def _shard_num(p: Path) -> int:
+    """Parse the integer suffix out of "<prefix>_NNNNN.jsonl.gz".
+
+    Path.stem only strips one extension (".gz"), leaving "<prefix>_NNNNN.jsonl",
+    so a naive .stem.split("_")[1] yields "NNNNN.jsonl" and ValueErrors on int().
+    """
+    name = p.name
+    for suf in (".jsonl.gz", ".gz", ".jsonl"):
+        if name.endswith(suf):
+            name = name[: -len(suf)]
+            break
+    return int(name.rsplit("_", 1)[-1])
+
 # ---------------------------------------------------------------------------
 # Source list -- mirrors configs/data/medical_mix.yaml. Each entry carries:
 #   name           folder name under <category>/
@@ -253,7 +267,7 @@ def write_jsonl_gz(
     """
     dest.mkdir(parents=True, exist_ok=True)
     existing = sorted(dest.glob(f"{prefix}_*.jsonl.gz"))
-    shard_idx = (int(existing[-1].stem.split("_")[1]) + 1) if existing else 0
+    shard_idx = (_shard_num(existing[-1]) + 1) if existing else 0
     total = 0
     fh = None
     tmp_path: Path | None = None
@@ -453,7 +467,7 @@ def download_pubmed(
         )
 
     existing_shards = sorted(dest.glob("shard_*.jsonl.gz"))
-    shard_idx = (int(existing_shards[-1].stem.split("_")[1]) + 1) if existing_shards else 0
+    shard_idx = (_shard_num(existing_shards[-1]) + 1) if existing_shards else 0
 
     # Newest-first: PubMed files are PMID-sorted (low file number = oldest
     # articles), and the year filter rejects pre-2018 docs, so the first ~1000

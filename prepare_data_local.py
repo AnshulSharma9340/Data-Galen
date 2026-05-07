@@ -386,10 +386,12 @@ def download_pubmed(
 ) -> int:
     raw_xml = dest / "_raw_xml"
     raw_xml.mkdir(parents=True, exist_ok=True)
+    dest.mkdir(parents=True, exist_ok=True)
     # NCBI hosts the same archive over HTTPS at the same path. HTTPS avoids the
     # passive-FTP control/data split that drops through NATs and firewalls.
     base_url = f"https://{host}{base_path}"
     log.info("pubmed: https %s", base_url)
+    print(f"[pubmed] fetching index {base_url}", flush=True)
     req = urllib.request.Request(base_url, headers={"User-Agent": "medllm-data/0.1"})
     with urllib.request.urlopen(req, timeout=120) as resp:
         index_html = resp.read().decode("utf-8", errors="ignore")
@@ -400,13 +402,19 @@ def download_pubmed(
     if max_files:
         files = files[-max_files:]
     log.info("pubmed: %d files", len(files))
+    print(f"[pubmed] {len(files)} XML files in baseline", flush=True)
+
+    # Stage 1: download XML files (already resume-safe: skip non-empty existing).
+    n_skipped_dl = 0
     for fname in files:
         target = raw_xml / fname
         if target.exists() and target.stat().st_size > 0:
+            n_skipped_dl += 1
             continue
         tmp = target.with_suffix(target.suffix + ".tmp")
         url = base_url + fname
         log.info("pubmed: GET %s", fname)
+        print(f"[pubmed] download {fname}", flush=True)
         for attempt in range(3):
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": "medllm-data/0.1"})
@@ -422,42 +430,94 @@ def download_pubmed(
                     raise
                 time.sleep(2 ** attempt)
         os.replace(tmp, target)
+    if n_skipped_dl:
+        print(f"[pubmed] skipped {n_skipped_dl} XML files already on disk", flush=True)
 
-    def _records() -> Iterator[dict]:
-        n = 0
-        for xml_gz in sorted(raw_xml.glob("*.xml.gz")):
-            try:
-                with gzip.open(xml_gz, "rb") as f:
-                    tree = ET.parse(f)
-            except (ET.ParseError, OSError) as e:
-                log.warning("pubmed: skipping %s (%s)", xml_gz.name, e)
-                continue
-            for art in tree.iterfind(".//PubmedArticle"):
-                yr_node = art.find(".//PubDate/Year")
-                year = (
-                    int(yr_node.text)
-                    if yr_node is not None and yr_node.text and yr_node.text.isdigit()
-                    else None
-                )
-                if years and year not in years:
-                    continue
-                title_el = art.find(".//ArticleTitle")
-                abs_els = art.findall(".//Abstract/AbstractText")
-                title = "".join(title_el.itertext()) if title_el is not None else ""
-                abstract = "\n".join("".join(a.itertext()) for a in abs_els)
-                if not abstract.strip():
-                    continue
-                yield {
-                    "text": f"{title}\n\n{abstract}".strip(),
-                    "source": source_name,
-                    "category": category,
-                    "year": year,
-                }
-                n += 1
-                if max_docs and n >= max_docs:
-                    return
+    # Stage 2: extract -> shards. One shard per XML file so a crash mid-extract
+    # only loses the XML currently being parsed; everything else is durable.
+    # Memory: iterparse + element.clear() so each article is GC'd after writing.
+    progress_path = dest / "_extract_done.json"
+    progress: dict[str, Any] = {"done": [], "n_docs": 0}
+    if progress_path.exists():
+        try:
+            progress = json.loads(progress_path.read_text())
+        except json.JSONDecodeError:
+            progress = {"done": [], "n_docs": 0}
+    done_set: set[str] = set(progress.get("done", []))
+    n_total: int = int(progress.get("n_docs", 0))
+    if done_set:
+        print(
+            f"[pubmed] resume: {len(done_set)} XML files already extracted, "
+            f"{n_total:,} docs on disk",
+            flush=True,
+        )
 
-    return write_jsonl_gz(dest, _records())
+    existing_shards = sorted(dest.glob("shard_*.jsonl.gz"))
+    shard_idx = (int(existing_shards[-1].stem.split("_")[1]) + 1) if existing_shards else 0
+
+    xml_files = sorted(raw_xml.glob("*.xml.gz"))
+    print(f"[pubmed] extracting {len(xml_files) - len(done_set)} XML files", flush=True)
+    for xml_gz in xml_files:
+        if xml_gz.name in done_set:
+            continue
+        if max_docs and n_total >= max_docs:
+            break
+        shard_path = dest / f"shard_{shard_idx:05d}.jsonl.gz"
+        tmp = shard_path.with_suffix(shard_path.suffix + ".tmp")
+        n_in_file = 0
+        t0 = time.perf_counter()
+        log.info("pubmed: extract %s -> %s", xml_gz.name, shard_path.name)
+        print(f"[pubmed] extract {xml_gz.name} -> {shard_path.name}", flush=True)
+        try:
+            with gzip.open(xml_gz, "rb") as f, gzip.open(tmp, "wt", encoding="utf-8") as out:
+                for event, art in ET.iterparse(f, events=("end",)):
+                    if art.tag != "PubmedArticle":
+                        continue
+                    yr_node = art.find(".//PubDate/Year")
+                    year = (
+                        int(yr_node.text)
+                        if yr_node is not None and yr_node.text and yr_node.text.isdigit()
+                        else None
+                    )
+                    if years and year not in years:
+                        art.clear()
+                        continue
+                    title_el = art.find(".//ArticleTitle")
+                    abs_els = art.findall(".//Abstract/AbstractText")
+                    title = "".join(title_el.itertext()) if title_el is not None else ""
+                    abstract = "\n".join("".join(a.itertext()) for a in abs_els)
+                    art.clear()
+                    if not abstract.strip():
+                        continue
+                    rec = {
+                        "text": f"{title}\n\n{abstract}".strip(),
+                        "source": source_name,
+                        "category": category,
+                        "year": year,
+                    }
+                    out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    n_in_file += 1
+                    n_total += 1
+                    if max_docs and n_total >= max_docs:
+                        break
+        except (ET.ParseError, OSError) as e:
+            log.warning("pubmed: skipping %s (%s)", xml_gz.name, e)
+            if tmp.exists():
+                tmp.unlink()
+            continue
+        os.replace(tmp, shard_path)
+        done_set.add(xml_gz.name)
+        progress = {"done": sorted(done_set), "n_docs": n_total}
+        progress_path.write_text(json.dumps(progress))
+        shard_idx += 1
+        dt = time.perf_counter() - t0
+        rate = n_in_file / dt if dt else 0.0
+        print(
+            f"[pubmed] {xml_gz.name}: {n_in_file:,} docs in {dt:.1f}s "
+            f"({rate:.0f}/s) | total={n_total:,}",
+            flush=True,
+        )
+    return n_total
 
 
 def download_ctgov(
@@ -652,9 +712,12 @@ def phi_redact(text: str) -> str:
 # DEDUPLICATION
 # ===========================================================================
 def sha256_dedup(records: Iterable[dict]) -> Iterator[dict]:
-    seen: set[str] = set()
+    # Truncated 128-bit prefix instead of full 256-bit hex: collision probability
+    # is < 1e-18 at 30M docs, and memory drops from ~120 B/entry (str) to
+    # ~32 B/entry (bytes) -- meaningful on small VMs with 30M+ pubmed docs.
+    seen: set[bytes] = set()
     for r in records:
-        h = hashlib.sha256(r["text"].encode("utf-8")).hexdigest()
+        h = hashlib.sha256(r["text"].encode("utf-8")).digest()[:16]
         if h in seen:
             continue
         seen.add(h)
@@ -745,8 +808,9 @@ def _filter_shard_worker(
     tmp = out.with_suffix(out.suffix + ".tmp")
     rules = QualityRules(**rules_dict)
     seen = kept = 0
-    sys.stderr.write(f"[filter] {src.name}: started\n")
-    sys.stderr.flush()
+    # Workers spawn fresh on Windows -- they don't inherit the root logger
+    # config, so use print(..., flush=True) to guarantee progress is visible.
+    print(f"[filter] {src.name}: started", flush=True)
     with gzip.open(tmp, "wt", encoding="utf-8") as fh:
         for rec in iter_jsonl_gz(src):
             seen += 1
@@ -762,11 +826,9 @@ def _filter_shard_worker(
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
             kept += 1
             if seen % 10_000 == 0:
-                sys.stderr.write(f"[filter] {src.name}: seen={seen:,} kept={kept:,}\n")
-                sys.stderr.flush()
+                print(f"[filter] {src.name}: seen={seen:,} kept={kept:,}", flush=True)
     os.replace(tmp, out)
-    sys.stderr.write(f"[filter] {src.name}: done seen={seen:,} kept={kept:,}\n")
-    sys.stderr.flush()
+    print(f"[filter] {src.name}: done seen={seen:,} kept={kept:,}", flush=True)
     return shard_path, seen, kept
 
 
@@ -779,6 +841,7 @@ def run_download(src: dict, src_dir: Path, max_docs: int | None,
     marker = src_dir / "_DOWNLOAD_DONE"
     if marker.exists():
         log.info("[%s] _DOWNLOAD_DONE present, skipping download", src["name"])
+        print(f"[download][{src['name']}] _DOWNLOAD_DONE present, skipping", flush=True)
         return
     fn = DOWNLOADERS[src["kind"]]
     args = dict(src["args"])
@@ -789,10 +852,12 @@ def run_download(src: dict, src_dir: Path, max_docs: int | None,
     args["source_name"] = src["name"]
     args["category"] = src["category"]
     log.info("=== download %s/%s ===", src["category"], src["name"])
+    print(f"[download][{src['name']}] start (kind={src['kind']})", flush=True)
     t0 = time.perf_counter()
     kept = fn(raw_dir, **args)
     dt = time.perf_counter() - t0
     log.info("[%s] downloaded %s docs in %.1fs", src["name"], f"{kept:,}", dt)
+    print(f"[download][{src['name']}] DOWNLOAD DONE: {kept:,} docs in {dt:.1f}s", flush=True)
     marker.write_text(json.dumps({
         "docs": kept, "seconds": dt,
         "category": src["category"], "weight": src["weight"],
@@ -815,43 +880,85 @@ def run_clean(
     done_marker = src_dir / "_CLEAN_DONE"
     if done_marker.exists():
         log.info("[%s] _CLEAN_DONE present, skipping clean", src["name"])
+        print(f"[clean][{src['name']}] _CLEAN_DONE present, skipping", flush=True)
         return
+    # PubMed writes shards to src_dir directly (one shard per XML file); other
+    # sources still write to src_dir/raw. Look in both so clean works either way.
     raw_shards = sorted(raw_dir.glob("shard_*.jsonl.gz"))
     if not raw_shards:
         log.warning("[%s] no raw shards in %s -- run download first", src["name"], raw_dir)
+        print(f"[clean][{src['name']}] no raw shards found, skipping", flush=True)
         return
 
-    # wipe stale partials
+    print(
+        f"[clean][{src['name']}] start: {len(raw_shards)} raw shards | "
+        f"pii={do_pii} langid={do_lang} minhash={do_minhash} workers={num_workers}",
+        flush=True,
+    )
+
+    # wipe stale partials in cleaned/ so a previous crash doesn't merge with new run
     if cleaned_dir.exists():
         for stale in list(cleaned_dir.glob("*.jsonl.gz*")):
             log.warning("[%s] removing stale %s", src["name"], stale.name)
+            print(f"[clean][{src['name']}] removing stale {stale.name}", flush=True)
             stale.unlink()
 
-    # Stage 1: parallel filter
+    # Stage 1: parallel filter -- per-shard outputs are durable, so resuming
+    # after a crash skips already-filtered shards.
     filt_dir = src_dir / "_filtered"
     filt_dir.mkdir(parents=True, exist_ok=True)
     work = []
+    n_reused = 0
     for shard in raw_shards:
         out_p = filt_dir / f"filt_{shard.stem}.jsonl.gz"
         if out_p.exists():
-            log.info("[%s] reusing filtered %s", src["name"], out_p.name)
+            n_reused += 1
             continue
         work.append((str(shard), str(out_p), rules.__dict__, do_lang, do_pii))
+    if n_reused:
+        print(
+            f"[clean][{src['name']}] resume: reusing {n_reused} already-filtered shards",
+            flush=True,
+        )
 
     if work:
         n_proc = max(1, min(len(work), num_workers))
         log.info("[%s] filtering %d shards with %d workers", src["name"], len(work), n_proc)
+        print(
+            f"[clean][{src['name']}] stage 1/2 filter: {len(work)} shards x {n_proc} workers",
+            flush=True,
+        )
+        t_filt = time.perf_counter()
         with ProcessPoolExecutor(max_workers=n_proc) as pool:
             futs = [pool.submit(_filter_shard_worker, *w) for w in work]
+            done = 0
             for fut in as_completed(futs):
                 p, seen, kept = fut.result()
+                done += 1
                 log.info("[%s] %s seen=%d kept=%d", src["name"], Path(p).name, seen, kept)
+                print(
+                    f"[clean][{src['name']}] filter {done}/{len(work)}: "
+                    f"{Path(p).name} seen={seen:,} kept={kept:,}",
+                    flush=True,
+                )
+        print(
+            f"[clean][{src['name']}] filter done in {time.perf_counter() - t_filt:.1f}s",
+            flush=True,
+        )
+    else:
+        print(f"[clean][{src['name']}] stage 1/2 filter: nothing to do", flush=True)
 
     filt_shards = sorted(filt_dir.glob("*.jsonl.gz"))
     if not filt_shards:
         raise RuntimeError(f"[{src['name']}] filter produced no output")
 
-    # Stage 2: dedup (sha256 + optional minhash)
+    # Stage 2: dedup (sha256 + optional minhash) -- streaming so memory stays bounded.
+    print(
+        f"[clean][{src['name']}] stage 2/2 dedup: sha256={'on'} "
+        f"minhash={'on' if do_minhash else 'off'}",
+        flush=True,
+    )
+
     def _merged() -> Iterator[dict]:
         for fs in filt_shards:
             yield from iter_jsonl_gz(fs)
@@ -864,8 +971,12 @@ def run_clean(
             n += 1
             if n % every == 0:
                 dt = time.perf_counter() - t0
-                log.info("[%s] %s: %d docs in %.1fs (%.0f/s)",
-                         src["name"], stage, n, dt, n / dt if dt else 0)
+                rate = n / dt if dt else 0.0
+                log.info("[%s] %s: %d docs in %.1fs (%.0f/s)", src["name"], stage, n, dt, rate)
+                print(
+                    f"[clean][{src['name']}] {stage}: {n:,} docs ({rate:.0f}/s)",
+                    flush=True,
+                )
 
     pipeline: Iterable[dict] = sha256_dedup(_tick(_merged(), "sha256"))
     if do_minhash:
@@ -883,6 +994,7 @@ def run_clean(
         "target_tokens": src["target_tokens"],
     }))
     log.info("[%s] CLEAN DONE: kept=%s docs", src["name"], f"{kept:,}")
+    print(f"[clean][{src['name']}] CLEAN DONE: kept={kept:,} docs", flush=True)
 
     # cleanup intermediate
     for fp in filt_dir.glob("*.jsonl.gz"):
@@ -1021,6 +1133,26 @@ def main() -> int:
              do_pii, do_lang, do_minhash, num_workers)
 
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- resume status banner: which sources are already done? ----
+    print("=" * 72, flush=True)
+    print(f"resume status ({len(selected)} source(s) selected):", flush=True)
+    for s in selected:
+        sd = out_dir / s["category"] / s["name"]
+        dl = "DONE " if (sd / "_DOWNLOAD_DONE").exists() else "todo "
+        cl = "DONE " if (sd / "_CLEAN_DONE").exists() else "todo "
+        # show partial pubmed extract progress if present
+        extra = ""
+        prog = sd / "_extract_done.json"
+        if prog.exists():
+            try:
+                p = json.loads(prog.read_text())
+                extra = f" (extracted {len(p.get('done', []))} XML files, {p.get('n_docs', 0):,} docs)"
+            except json.JSONDecodeError:
+                pass
+        print(f"  - {s['category']:8s}/{s['name']:20s}  download={dl} clean={cl}{extra}",
+              flush=True)
+    print("=" * 72, flush=True)
 
     failures: list[tuple[str, str]] = []
     summaries: list[dict] = []

@@ -455,19 +455,22 @@ def download_pubmed(
     existing_shards = sorted(dest.glob("shard_*.jsonl.gz"))
     shard_idx = (int(existing_shards[-1].stem.split("_")[1]) + 1) if existing_shards else 0
 
-    xml_files = sorted(raw_xml.glob("*.xml.gz"))
-    print(f"[pubmed] extracting {len(xml_files) - len(done_set)} XML files", flush=True)
-    for xml_gz in xml_files:
-        if xml_gz.name in done_set:
-            continue
+    # Newest-first: PubMed files are PMID-sorted (low file number = oldest
+    # articles), and the year filter rejects pre-2018 docs, so the first ~1000
+    # files would yield 0 docs each. Process in reverse so meaningful output
+    # appears in the first minute instead of after ~2 hours of empty parses.
+    xml_files = sorted(raw_xml.glob("*.xml.gz"), reverse=True)
+    todo = [x for x in xml_files if x.name not in done_set]
+    print(f"[pubmed] extracting {len(todo)} XML files (newest first)", flush=True)
+    n_empty = 0
+    for xml_gz in todo:
         if max_docs and n_total >= max_docs:
             break
         shard_path = dest / f"shard_{shard_idx:05d}.jsonl.gz"
         tmp = shard_path.with_suffix(shard_path.suffix + ".tmp")
         n_in_file = 0
         t0 = time.perf_counter()
-        log.info("pubmed: extract %s -> %s", xml_gz.name, shard_path.name)
-        print(f"[pubmed] extract {xml_gz.name} -> {shard_path.name}", flush=True)
+        log.info("pubmed: extract %s", xml_gz.name)
         try:
             with gzip.open(xml_gz, "rb") as f, gzip.open(tmp, "wt", encoding="utf-8") as out:
                 for event, art in ET.iterparse(f, events=("end",)):
@@ -505,18 +508,36 @@ def download_pubmed(
             if tmp.exists():
                 tmp.unlink()
             continue
+        dt = time.perf_counter() - t0
+        if n_in_file == 0:
+            # Don't pollute disk with empty shards (every old XML file would
+            # produce one). Mark the XML as done so we don't reprocess on resume.
+            if tmp.exists():
+                tmp.unlink()
+            n_empty += 1
+            done_set.add(xml_gz.name)
+            progress = {"done": sorted(done_set), "n_docs": n_total}
+            progress_path.write_text(json.dumps(progress))
+            if n_empty % 25 == 0:
+                print(
+                    f"[pubmed] skipped {n_empty} empty files so far "
+                    f"(pre-{min(years) if years else '?'} articles); total={n_total:,}",
+                    flush=True,
+                )
+            continue
         os.replace(tmp, shard_path)
         done_set.add(xml_gz.name)
         progress = {"done": sorted(done_set), "n_docs": n_total}
         progress_path.write_text(json.dumps(progress))
         shard_idx += 1
-        dt = time.perf_counter() - t0
         rate = n_in_file / dt if dt else 0.0
         print(
-            f"[pubmed] {xml_gz.name}: {n_in_file:,} docs in {dt:.1f}s "
-            f"({rate:.0f}/s) | total={n_total:,}",
+            f"[pubmed] {xml_gz.name} -> {shard_path.name}: {n_in_file:,} docs "
+            f"in {dt:.1f}s ({rate:.0f}/s) | total={n_total:,}",
             flush=True,
         )
+    if n_empty:
+        print(f"[pubmed] {n_empty} XML files yielded 0 docs (year filter)", flush=True)
     return n_total
 
 
